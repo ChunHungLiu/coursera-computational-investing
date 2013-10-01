@@ -36,3 +36,6 @@ nosetests.xml
 
 # rope
 .ropeproject
+
+# mac hidden file
+.DS_Store
