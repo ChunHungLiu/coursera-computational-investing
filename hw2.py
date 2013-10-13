@@ -312,7 +312,7 @@ def main(argv=None):
             return find_actual_close_pre_ge_now_lt(df_data, threshold)
     elif find_options['event_type'] == "bollinger":
         if 'compare_threshold' not in find_options:
-            find_options['compare_threshold'] = 1.4
+            find_options['compare_threshold'] = 1.0
         debug("Looking for bollinger band (lookback=%d) falling below %f and %s above %f" 
                 % tuple([find_options[k] for k in ('lookback', 'threshold', 'compare', 'compare_threshold')]))
         def find_events(df_data):
