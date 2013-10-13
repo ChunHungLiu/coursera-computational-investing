@@ -70,7 +70,9 @@ def get_data(dt_start, dt_end, symbols, lookback=0):
         ldt_timestamps = lookback_timestamps[-(lookback-1):] + ldt_timestamps
 
     dataobj = da.DataAccess('Yahoo')
-    debug("getting data")
+    debug("getting data from %s to %s" \
+          % tuple([dt_day.strftime("%Y-%m-%d")
+                    for dt_day in (ldt_timestamps[ndx] for ndx in (0,-1))]))
     ldf_data = dataobj.get_data(ldt_timestamps, symbols, 'close')
 
     ldf_data = ldf_data.fillna(method='ffill')
