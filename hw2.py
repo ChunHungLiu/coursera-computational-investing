@@ -2,7 +2,8 @@
 # encoding: utf-8
 """
 Usage: python hw2.py {-fv} --start=<date> {--end=<date>|--duration=<# days>} 
-                     --dataset=(2008|2012) --threshold=<threshold>
+                     --dataset=(2008|2012) --event=(price|bollinger) --threshold=<threshold>
+                     {--lookback=<# days>}
                      --study.out=<filename> --study.view=(True|False) --study.compare=<index>
                      --trades.out=<filename> --trades.action=(BUY|SELL) --trades.amount=<# shares> --trades.after=<# days> 
 
@@ -12,7 +13,7 @@ previous day's actual close is greater than or equal to the threshold and curren
 is below)
 
 If study.out is provided, an pdf event study is generated.  If study.view is true, at the end of the
-program the pdf is displayed.  study.compare indicates what index to compare the returns to.  Defaults to $SPY
+program the pdf is displayed.  study.compare indicates what index to compare the returns to.  Defaults to $SPX
 
 If trades.out is provided, an csv orders file is generated.  On the day the event occurs, <trades.action> oder for <trades.amount> shares
 is executed. (<trades.action> defaults to 'BUY' and trades.amount defaults to 100).  And <trades.after> trading days after the event, the
@@ -22,6 +23,7 @@ Created by Space on 2013-09-24.
 Copyright (c) 2013. All rights reserved.
 
 """
+import pdb
 import csv
 import datetime as dt
 import getopt
@@ -35,11 +37,12 @@ import QSTK.qstkstudy.EventProfiler as ep
 import QSTK.qstkutil.DataAccess as da
 import QSTK.qstkutil.qsdateutil as du
 import numpy as np
-
+import pandas as pd
 
 # CONSTANTS
-KNOWN_DATASETS = ( "sp5002008", "sp5002012" )
+KNOWN_DATASETS = ( "sp5002012", "sp5002008" )
 TRADE_ACTIONS = ("BUY", "SELL")
+EVENT_TYPES = ("price", "bollinger")
 
 verbose = False
 
@@ -63,8 +66,36 @@ def ymd(dt_day):
     return [dt_day.year, dt_day.month, dt_day.day]
 
 
+def find_bollinger_events(d_data, lookback, threshold, market='$SPX', market_threshold=1.0):
+    df_bvals = get_bollinger_values(d_data['close'], lookback)
+    # pull out the market symbol and find days above threshold
+    s_market = df_bvals[market]
+    s_market_ge = s_market >= market_threshold
+    debug("found %d days with %s bollinger value above %f" % (s_market_ge.sum(), market, market_threshold))
+    # reshape series and expand it to dataframe for all stocks
+    m_market_ge = np.asmatrix(np.repeat(s_market_ge.values,df_bvals.shape[1]))
+    m_market_ge = m_market_ge.reshape(df_bvals.shape)
+    df_market_ge = pd.DataFrame(m_market_ge, df_bvals.index, df_bvals.columns)
 
-def find_actual_close_pre_ge_now_lt(threshold, d_data):
+    # find bollinger values less than threshold and greater than to find days
+    # where it flipped
+    df_bvals_le = (df_bvals <= threshold)
+    df_bvals_ge = (df_bvals >= threshold)
+    df_found = df_bvals_ge.shift().fillna(False) & df_bvals_le
+    debug("found %d events of bollinger value falling below %f" % (df_found.values.sum(), threshold))
+    df_found = df_found & df_market_ge
+    debug("found %d events of bollinger value falling below %f and %s above %f" % (df_found.values.sum(), threshold, market, market_threshold))
+    return df_found
+
+def get_bollinger_values(df_data, lookback):
+
+    mean = pd.rolling_mean(df_data, lookback)
+    std = pd.rolling_std(df_data, lookback)
+    price = df_data
+    return (price - mean)/std
+
+
+def find_actual_close_pre_ge_now_lt(d_data, threshold):
     """
     Given a threshold and a dictionary of DataFrames including actual_close data,
     returns an Event Matrix indicating the days a stock fell below threshold
@@ -77,7 +108,7 @@ def find_actual_close_pre_ge_now_lt(threshold, d_data):
     debug("found %d events with threshold %f" % (df_found.values.sum(), threshold))
     return df_found
     
-def get_events(dt_start, dt_end, dataset, find_events, extra_symbols=['$SPY']):
+def get_events(dt_start, dt_end, dataset, find_events, extra_symbols=['$SPX'], lookback=0):
     """
     Given a date range, the name of a dataset, a predicate for identifying events,
     returns an EventMatrix indicating the days an event occurred for a stock as well
@@ -94,24 +125,27 @@ def get_events(dt_start, dt_end, dataset, find_events, extra_symbols=['$SPY']):
     
     """
     ldt_timestamps = du.getNYSEdays(dt_start, dt_end, dt.timedelta(hours=16))
+    if lookback >= 0:
+        lookback_timestamps = du.getNYSEdays(dt_start - dt.timedelta(days=lookback*2),dt_start, dt.timedelta(hours=16))
+        ldt_timestamps = lookback_timestamps[-(lookback-1):] + ldt_timestamps
     
     dataobj = da.DataAccess('Yahoo')
     ls_symbols = dataobj.get_symbols_from_list(dataset)
     ls_symbols.extend(extra_symbols)
     
-    debug("getting data")
+    debug("getting data from %s to %s" \
+          % tuple([dt_day.strftime("%Y-%m-%d")
+                    for dt_day in (ldt_timestamps[ndx] for ndx in (0,-1))]))
     ls_keys = ['open', 'high', 'low', 'close', 'volume', 'actual_close']
     ldf_data = dataobj.get_data(ldt_timestamps, ls_symbols, ls_keys)
+    ldf_data = [ df.fillna(method='ffill') \
+                   .fillna(method='bfill') \
+                   .fillna(1.0) \
+                 for df in ldf_data]
     d_data = dict(zip(ls_keys, ldf_data))
-
-    for s_key in ls_keys:
-        d_data[s_key] = d_data[s_key].fillna(method='ffill')
-        d_data[s_key] = d_data[s_key].fillna(method='bfill')
-        d_data[s_key] = d_data[s_key].fillna(1.0)
-    
     return find_events(d_data), d_data
 
-def output_study(df_events, df_data, out_file, compare='$SPY', look=20):
+def output_study(df_events, df_data, out_file, compare='$SPX', look=20):
     # convert to float32 to match expected type for eventprofiler
     df_events = (df_events * 1.0).replace(0, np.NaN)
 
@@ -133,8 +167,10 @@ def output_trades(df_events, out_file, amount=100, action="BUY", after=5):
             for stock in itertools.imap(lambda t: t[0], 
                             itertools.ifilter(lambda t: t[1], row.iteritems())):
                 writer.writerow(ymd(df_events.index[ndx]) + [stock,action,amount])
-                if ndx + after < df_events.shape[0]:
-                    writer.writerow(ymd(df_events.index[ndx+after]) + [stock, inverse_action, amount])
+                after_ndx = ndx+after
+                if after_ndx >= df_events.shape[0]:
+                    after_ndx=-1
+                writer.writerow(ymd(df_events.index[after_ndx]) + [stock, inverse_action, amount])
 
 
 ######################
@@ -152,22 +188,25 @@ def main(argv=None):
 
     global verbose
     force = False
-    dataset = "sp5002012"
+    dataset = KNOWN_DATASETS[0]
     dt_start = None
     dt_end = None
-    threshold = 5.0
     study_out = None
-    study_options = { 'compare' : '$SPY'}
+    study_options = { 'compare' : '$SPX'}
+    find_options = { 'compare': '$SPX', 
+                     'threshold': 5.0,
+                     'lookback': 0,
+                     'event_type': EVENT_TYPES[0] }
     trades_out = None
     trades_options = {}
-    find_events = None
-    
+
     # parse arguments
     try:
-        opts, args = getopt.getopt(argv[1:], "?hvfs:e:d:t:c:", \
+        opts, args = getopt.getopt(argv[1:], "?hvfs:e:d:t:c:l:", \
                                    ["help","verbose","force",
                                     "start=","end=","duration=",             # date range options
-                                    "dataset=","threshold=",                 # find events options
+                                    "dataset=", "event=",
+                                    "lookback=", "threshold=",                 # find events options
                                     "study.out=","study.view=", "view="
                                         "study.compare=","compare=",
                                         "study.look=",                       # event study options
@@ -205,8 +244,18 @@ def main(argv=None):
             if dataset is None:
                 print "unknown dataset '%s'.  Proceeding anyway" % value
                 dataset = value
+        elif option == "--event":
+            find_options['event_type'] = None
+            for a_type in EVENT_TYPES:
+                if a_type.startswith(value.lower()):
+                    find_options['event_type'] = a_type
+                    break
+            if find_options['event_type'] is None:
+                raise Usage("unknown event: %s" % value)
         elif option in ("-t","--threshold"):
-            threshold = float(value)
+            find_options['threshold'] = float(value)
+        elif option in ("-l","--lookback"):
+            find_options['lookback'] = int(value)
         elif option == "--study.out":
             study_out = value
             if study_out.find(".") == -1:
@@ -214,7 +263,8 @@ def main(argv=None):
         elif option in ("--study.view", "--view"):
             study_options['view'] = bool(value)
         elif option in ("-c", "--study.compare","--compare"):
-            study_options['compare'] = value
+            for opts in (find_options, study_options):
+                opts['compare'] = value
         elif option == "--study.look":
             study_options['look'] = int(value)
         elif option == "--trades.out":
@@ -254,13 +304,27 @@ def main(argv=None):
           (dataset, dt_start.strftime("%Y-%m-%d"), dt_end.strftime("%Y-%m-%d")))
     debug("Comparing to %s" % study_options['compare'])
 
-    if find_events is None:
+    if find_options['event_type'] == "price":
+        threshold = find_options['threshold']
         debug("Looking for previous price >= %f and current price < %f" \
             % (threshold, threshold))
         def find_events(df_data):
-            return find_actual_close_pre_ge_now_lt(threshold, df_data)
+            return find_actual_close_pre_ge_now_lt(df_data, threshold)
+    elif find_options['event_type'] == "bollinger":
+        if 'compare_threshold' not in find_options:
+            find_options['compare_threshold'] = 1.4
+        debug("Looking for bollinger band (lookback=%d) falling below %f and %s above %f" 
+                % tuple([find_options[k] for k in ('lookback', 'threshold', 'compare', 'compare_threshold')]))
+        def find_events(df_data):
+            return find_bollinger_events(df_data, 
+                                         find_options['lookback'], 
+                                         find_options['threshold'],
+                                         market=find_options['compare'], 
+                                         market_threshold=find_options['compare_threshold'])
 
-    df_events, df_data = get_events(dt_start, dt_end, dataset, find_events, extra_symbols=[study_options['compare']])
+    extra_symbols = list(set([opts['compare'] for opts in find_options, study_options]))
+    df_events, df_data = get_events(dt_start, dt_end, dataset, find_events, 
+                                    extra_symbols=extra_symbols) # , lookback=find_options['lookback'])
     if trades_out is not None:
         output_trades(df_events, trades_out, **trades_options)
     if study_out is not None:
